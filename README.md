@@ -1,4 +1,4 @@
-# EJA Perto de Mim GO — Android
+# EJA Perto de Mim GO — Android v1.1
 
 Aplicativo para localizar escolas da rede estadual de Goiás que aparecem na lista oficial da SEDUC com oferta de Educação de Jovens e Adultos.
 
@@ -43,3 +43,14 @@ A lista oficial confirma que a escola oferta EJA, mas não garante vaga no momen
 - matrícula: portal `matricula.go.gov.br`;
 - consulta de vagas: SEDUC Goiás;
 - localização do CEP: BrasilAPI.
+
+
+## Correções da versão 1.1
+
+- corrige a leitura da tabela oficial da SEDUC;
+- adiciona um segundo método de leitura como segurança;
+- informa erro de formato em vez de dizer incorretamente que não existem escolas;
+- limita as consultas de coordenadas para evitar demora excessiva;
+- corrige os textos cortados nos botões;
+- armazena a grande página oficial em arquivo de cache;
+- gera o APK com o nome `EJA-Perto-de-Mim-GO-v1.1.apk`.

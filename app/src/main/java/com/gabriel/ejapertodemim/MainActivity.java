@@ -131,7 +131,13 @@ public class MainActivity extends Activity {
         refreshButton.setOnClickListener(v -> {
             officialHtml = "";
             prefs.edit().remove("official_html").remove("official_updated").apply();
-            Toast.makeText(this, "Base local apagada. A próxima busca baixará a lista oficial novamente.", Toast.LENGTH_LONG).show();
+            File cacheFile = new File(getCacheDir(), "seduc_escolas.html");
+            if (cacheFile.exists()) cacheFile.delete();
+            Toast.makeText(
+                    this,
+                    "Base local apagada. A próxima busca baixará a lista oficial novamente.",
+                    Toast.LENGTH_LONG
+            ).show();
         });
         filterRow.addView(refreshButton, new LinearLayout.LayoutParams(dp(145), dp(50)));
         root.addView(filterRow);
@@ -151,17 +157,24 @@ public class MainActivity extends Activity {
         addressText.setPadding(0, 0, 0, dp(10));
         root.addView(addressText);
 
-        LinearLayout officialButtons = row();
+        LinearLayout officialButtonsTop = row();
         Button enroll = button("Inscrição oficial");
         enroll.setOnClickListener(v -> openUrl(ENROLL_URL));
         Button vacancies = button("Consultar vagas");
         vacancies.setOnClickListener(v -> openUrl(VACANCIES_URL));
+        officialButtonsTop.addView(enroll, tallWeightedButton());
+        officialButtonsTop.addView(vacancies, tallWeightedButton());
+        root.addView(officialButtonsTop);
+
+        LinearLayout officialButtonsBottom = row();
         Button info = button("Regras da EJA");
         info.setOnClickListener(v -> openUrl(EJA_INFO_URL));
-        officialButtons.addView(enroll, weightedButton());
-        officialButtons.addView(vacancies, weightedButton());
-        officialButtons.addView(info, weightedButton());
-        root.addView(officialButtons);
+        LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(52)
+        );
+        infoParams.setMargins(dp(2), dp(2), dp(2), dp(4));
+        officialButtonsBottom.addView(info, infoParams);
+        root.addView(officialButtonsBottom);
 
         TextView warning = text(
                 "Importante: o aplicativo confirma a oferta de EJA na lista oficial, mas a vaga atual precisa ser confirmada no portal de matrícula ou diretamente com a escola.",
@@ -195,6 +208,7 @@ public class MainActivity extends Activity {
         }
 
         prefs.edit().putString("last_cep", cep).apply();
+        final String selectedStage = stageSpinner.getSelectedItem().toString();
         searchButton.setEnabled(false);
         refreshButton.setEnabled(false);
         resultsBox.removeAllViews();
@@ -224,14 +238,24 @@ public class MainActivity extends Activity {
                 });
 
                 officialHtml = getOfficialHtml();
-                ArrayList<School> schools = parseSchools(officialHtml, userLocation);
-                String stage = stageSpinner.getSelectedItem().toString();
-                schools = filterStage(schools, stage);
+                ArrayList<School> detectedSchools = parseSchools(officialHtml, userLocation);
+                if (detectedSchools.isEmpty()) {
+                    throw new IOException(
+                            "A página oficial foi acessada, mas o formato da lista não pôde ser lido. " +
+                            "Toque em Atualizar base e tente novamente."
+                    );
+                }
+
+                final int totalDetected = detectedSchools.size();
+                ArrayList<School> schools = filterStage(detectedSchools, selectedStage);
 
                 if (schools.isEmpty()) {
                     runOnUiThread(() -> {
                         finishLoading();
-                        status.setText("Nenhuma escola com esse filtro foi identificada na lista oficial.");
+                        status.setText(
+                                "A base oficial foi lida (" + totalDetected +
+                                " escola(s) com EJA), mas nenhuma corresponde ao filtro selecionado."
+                        );
                     });
                     return;
                 }
@@ -302,37 +326,117 @@ public class MainActivity extends Activity {
     private String getOfficialHtml() throws Exception {
         if (!officialHtml.isEmpty()) return officialHtml;
 
-        String saved = prefs.getString("official_html", "");
-        long updated = prefs.getLong("official_updated", 0);
-        long age = System.currentTimeMillis() - updated;
-
-        if (!saved.isEmpty() && age < 7L * 24 * 60 * 60 * 1000) {
-            officialHtml = saved;
-            return saved;
+        File cacheFile = new File(getCacheDir(), "seduc_escolas.html");
+        long maxAge = 7L * 24 * 60 * 60 * 1000;
+        if (cacheFile.exists() &&
+                System.currentTimeMillis() - cacheFile.lastModified() < maxAge) {
+            try (FileInputStream input = new FileInputStream(cacheFile)) {
+                officialHtml = readAll(input);
+                if (!officialHtml.isEmpty()) return officialHtml;
+            }
         }
 
-        String html = httpGet(SCHOOLS_URL, "Mozilla/5.0 EJA-Perto-de-Mim-GO/1.0");
+        String html = httpGet(
+                SCHOOLS_URL,
+                "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36"
+        );
         officialHtml = html;
 
-        // SharedPreferences can hold this page, but avoid crashing if a device limits the transaction.
-        try {
-            prefs.edit()
-                    .putString("official_html", html)
-                    .putLong("official_updated", System.currentTimeMillis())
-                    .apply();
+        try (FileOutputStream output = new FileOutputStream(cacheFile)) {
+            output.write(html.getBytes(StandardCharsets.UTF_8));
         } catch (Exception ignored) {}
 
         return html;
     }
 
     private ArrayList<School> parseSchools(String html, UserLocation user) {
+        ArrayList<School> tableSchools = parseTableRows(html, user);
+        if (!tableSchools.isEmpty()) return tableSchools;
+        return parsePlainTextSchools(html, user);
+    }
+
+    private ArrayList<School> parseTableRows(String html, UserLocation user) {
+        ArrayList<School> schools = new ArrayList<>();
+        HashSet<String> dedupe = new HashSet<>();
+
+        Pattern rowPattern = Pattern.compile("(?is)<tr[^>]*>(.*?)</tr>");
+        Pattern cellPattern = Pattern.compile("(?is)<t[dh][^>]*>(.*?)</t[dh]>");
+        Matcher rowMatcher = rowPattern.matcher(html);
+
+        while (rowMatcher.find()) {
+            ArrayList<String> cells = new ArrayList<>();
+            Matcher cellMatcher = cellPattern.matcher(rowMatcher.group(1));
+            while (cellMatcher.find()) {
+                cells.add(decodeHtmlCell(cellMatcher.group(1)));
+            }
+            if (cells.size() < 7) continue;
+
+            int codeIndex = -1;
+            String codeValue = "";
+            for (int i = 0; i < cells.size(); i++) {
+                String candidate = digits(cells.get(i));
+                if (candidate.matches("52\\d{6}")) {
+                    codeIndex = i;
+                    codeValue = candidate;
+                    break;
+                }
+            }
+
+            if (codeIndex < 2 || codeIndex + 4 >= cells.size()) continue;
+
+            String municipality = cells.get(codeIndex - 1);
+            String coordination = cells.get(codeIndex - 2);
+            String name = cells.get(codeIndex + 1);
+            String modalities = cells.get(codeIndex + 2);
+            String rawAddress = cells.get(codeIndex + 3);
+            String emailCell = cells.get(codeIndex + 4);
+
+            String normalizedModalities = normalize(modalities);
+            if (!(normalizedModalities.contains("educacao de jovens e adultos") ||
+                    normalizedModalities.contains("eja integrada"))) {
+                continue;
+            }
+
+            Matcher cepMatcher = cepPattern.matcher(rawAddress);
+            if (!cepMatcher.find()) continue;
+
+            School school = new School();
+            school.code = codeValue;
+            school.cep = digits(cepMatcher.group(1));
+            if (school.cep.length() != 8) continue;
+
+            school.name = clean(name);
+            school.modalities = clean(modalities);
+            school.address = clean(rawAddress.substring(0, cepMatcher.start()));
+            school.prefix = clean(coordination + " " + municipality);
+
+            Matcher emailMatcher = emailPattern.matcher(emailCell);
+            school.email = emailMatcher.find()
+                    ? emailMatcher.group()
+                    : school.code + "@seduc.go.gov.br";
+
+            school.sameCity = normalize(municipality).equals(normalize(user.city));
+            school.cepDifference = Math.abs(parseLong(school.cep) - parseLong(user.cep));
+
+            if (school.name.length() < 4) continue;
+            String key = school.code + "|" + school.cep;
+            if (dedupe.add(key)) schools.add(school);
+        }
+
+        return schools;
+    }
+
+    private ArrayList<School> parsePlainTextSchools(String html, UserLocation user) {
         String plain = Html.fromHtml(html, Html.FROM_HTML_MODE_LEGACY)
                 .toString()
                 .replace('\u00A0', ' ')
-                .replaceAll("[\\t ]+", " ")
-                .replaceAll("\\n{2,}", "\n");
+                .replaceAll("\\s+", " ")
+                .trim();
 
-        String[] chunks = plain.split("(?=CRE-)");
+        String[] chunks = plain.split(
+                "(?=(?:CRE-|CENTRO DE ATEND\\\\. ED\\\\. FLORESCER))"
+        );
         ArrayList<School> schools = new ArrayList<>();
         HashSet<String> dedupe = new HashSet<>();
 
@@ -348,9 +452,9 @@ public class MainActivity extends Activity {
             if (!code.find() || !cep.find()) continue;
 
             int modalityStart = firstPositive(
-                    chunk.indexOf(" Educação de Jovens e Adultos", code.end()),
-                    chunk.indexOf(" EJA Integrada", code.end()),
-                    chunk.indexOf(" Educação Especial de Jovens e Adultos", code.end())
+                    chunk.indexOf("Educação de Jovens e Adultos", code.end()),
+                    chunk.indexOf("EJA Integrada", code.end()),
+                    chunk.indexOf("Educação Especial de Jovens e Adultos", code.end())
             );
             if (modalityStart < 0 || modalityStart >= cep.start()) continue;
 
@@ -386,6 +490,10 @@ public class MainActivity extends Activity {
         return schools;
     }
 
+    private String decodeHtmlCell(String value) {
+        return clean(Html.fromHtml(value, Html.FROM_HTML_MODE_LEGACY).toString());
+    }
+
     private ArrayList<School> filterStage(ArrayList<School> schools, String stage) {
         if ("Todas".equals(stage)) return schools;
         ArrayList<School> filtered = new ArrayList<>();
@@ -409,10 +517,12 @@ public class MainActivity extends Activity {
 
         LinkedHashMap<String, School> chosen = new LinkedHashMap<>();
         for (School s : all) {
-            if (s.sameCity) chosen.put(s.code, s);
+            if (s.sameCity && chosen.size() < 20) {
+                chosen.put(s.code, s);
+            }
         }
         for (School s : all) {
-            if (chosen.size() >= 30) break;
+            if (chosen.size() >= 25) break;
             chosen.put(s.code, s);
         }
         return new ArrayList<>(chosen.values());
@@ -573,7 +683,9 @@ public class MainActivity extends Activity {
         connection.setReadTimeout(30000);
         connection.setInstanceFollowRedirects(true);
         connection.setRequestProperty("User-Agent", userAgent);
-        connection.setRequestProperty("Accept", "text/html,application/json");
+        connection.setRequestProperty("Accept", "text/html,application/json;q=0.9,*/*;q=0.8");
+        connection.setRequestProperty("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.7");
+        connection.setRequestProperty("Cache-Control", "no-cache");
 
         int code = connection.getResponseCode();
         InputStream input = code >= 200 && code < 300
@@ -662,12 +774,20 @@ public class MainActivity extends Activity {
     private Button button(String value) {
         Button button = new Button(this);
         button.setText(value);
+        button.setTextSize(12);
         button.setAllCaps(false);
+        button.setPadding(dp(4), 0, dp(4), 0);
         return button;
     }
 
     private LinearLayout.LayoutParams weightedButton() {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(48), 1);
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(50), 1);
+        p.setMargins(dp(2), dp(2), dp(2), dp(2));
+        return p;
+    }
+
+    private LinearLayout.LayoutParams tallWeightedButton() {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(56), 1);
         p.setMargins(dp(2), dp(2), dp(2), dp(2));
         return p;
     }
